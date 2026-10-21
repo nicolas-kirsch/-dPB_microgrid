@@ -1,0 +1,7 @@
+Run directory: /home/kirsch/microgrid_pb/ren_mad/models/ren_init1_20261021T120100_879560Z
+Guard baseline fixed:pre_5_dgu: peak=4.112795V
+Guard baseline fixed:plug_05_45: peak=0.613329V
+Guard baseline fixed:plug_05_45_unplug_3: peak=1.574103V
+Guard baseline load:plug_05_45:6: peak=0.438321V
+Guard baseline plugin:plug_05_45: peak=0.251335V
+Guard baseline unplug:plug_05_45_unplug_3: peak=1.976624V

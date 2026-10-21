@@ -101,7 +101,7 @@ python main_PnP_training.py --resume models/training_state.pt --epochs 152 --bud
 
 For resume, `--epochs` specifies the **total target epoch count**. The bundled state resumes after epoch 146; keeping target 152 preserves its original cosine learning-rate schedule.
 
-Each run saves `last.pt` and `selected_controller.pt` in a new `models/training_<UTC>/` directory. The selected checkpoint is the best feasible model on the fixed training guard. The last checkpoint also stores optimizer/RNG state for continuation. The cooperative time budget is checked between complete epochs, so a run can finish before the requested epoch count.
+Each run saves `last.pt` and `selected_controller.pt` in a new `models/<run>/` directory. The selected checkpoint is the best feasible model on the fixed training guard. The last checkpoint also stores optimizer/RNG state for continuation. The cooperative time budget is checked between complete epochs, so a run can finish before the requested epoch count.
 
 The training recipe uses a sampling time of **50 microseconds**, prescribed network gain **gamma_R = 25**, six REN internal states and six equilibrium-network coordinates per DGU, and a local MAD MLP of dimensions **4 → 8 → 1**. Each complete epoch has six differentiable 150 ms rollouts (3000 steps) and four Adam updates. Model selection uses a fixed six-case, 500 ms guard with equal weight for the four scenario groups.
 
@@ -117,7 +117,7 @@ To train from a new controller initialized from the settings seed, use `--fresh`
 
 ```bash
 python main_PnP_training.py --fresh --epochs 152 --budget-hours 100
-python main_PnP_training.py --resume models/training_<UTC>/last.pt --epochs 250 --stop-epoch 212 --budget-hours 100
+python main_PnP_training.py --resume models/<run>/last.pt --epochs 250 --stop-epoch 212 --budget-hours 100
 ```
 
 ## Representative figures

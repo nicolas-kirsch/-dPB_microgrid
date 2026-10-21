@@ -7,6 +7,7 @@ import json
 import math
 import numpy as np
 import random
+import signal
 import time
 import torch
 from collections import defaultdict
@@ -18,6 +19,7 @@ from numbers import Integral
 from pathlib import Path
 from .model_io import ROOT, build_model, load_model, save_checkpoint
 from .plant import Plant, topology_library, VoltageDomainError
+from .run_log import start_run_log, write_json
 from .settings import default_parameters
 from .simulation import trajectory_metrics, run_scenario, Scenario, experiment_loads, fixed_scenario
 
@@ -607,6 +609,9 @@ def make_optimizer(model, settings):
     return torch.optim.Adam(groups)
 
 
+ARCHITECTURE = "ssm"
+
+
 # Training entry point
 
 
@@ -628,17 +633,23 @@ def validate_config(cfg):
 
 def train(args):
     torch.set_num_threads(1)
-    if args.resume and args.model:
-        raise ValueError("Use either --resume or --model")
+    # Batch schedulers stop jobs with SIGTERM; treat it like Ctrl-C (roll back the partial epoch).
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    started = time.monotonic()
+    if sum(map(bool, (args.resume, args.model, args.fresh))) > 1:
+        raise ValueError("Use only one of --resume, --model and --fresh")
+    if args.init_seed is not None and (args.resume or args.model):
+        raise ValueError("--init-seed only applies to a fresh controller")
     if args.resume or args.model:
         model, payload = load_model(args.resume or args.model)
         cfg = deepcopy(payload["config"]) if args.resume else default_parameters()
         if cfg["controller"] != payload["config"]["controller"] or cfg["primary"] != payload["config"]["primary"]:
             raise ValueError("Checkpoint architecture and primary must match the configuration")
     else:
-        # Fresh start: a new controller initialized from the settings seed.
+        # Fresh start: a new controller initialized from the init seed.
         cfg = default_parameters()
-        torch.manual_seed(cfg["seed"])
+        cfg["init_seed"] = cfg["seed"] if args.init_seed is None else args.init_seed
+        torch.manual_seed(cfg["init_seed"])
         model, payload = build_model(cfg), {"guard_parent": None}
     if args.epochs is not None:
         cfg["training"]["epochs"] = args.epochs
@@ -648,6 +659,9 @@ def train(args):
     start_epoch = payload["epoch"] if args.resume else 0
     if cfg["training"]["epochs"] <= start_epoch:
         raise ValueError("For resume, --epochs is the TOTAL target, greater than the saved epoch")
+    stop_epoch = cfg["training"]["epochs"] if args.stop_epoch is None else args.stop_epoch
+    if not start_epoch < stop_epoch <= cfg["training"]["epochs"]:
+        raise ValueError("--stop-epoch must lie after the saved epoch and not beyond --epochs")
     model.train()
     optimizer = make_optimizer(model, cfg["training"])
     if args.resume:
@@ -663,27 +677,33 @@ def train(args):
     else:
         torch.manual_seed(cfg["seed"])
         random.seed(cfg["seed"])
-    output = args.output or ROOT / "models" / ("training_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ"))
+    # Unique per run (method, init seed, UTC time); an existing directory is never reused.
+    name = "_".join([ARCHITECTURE, *([f"init{cfg['init_seed']}"] if "init_seed" in cfg else []),
+                     datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")])
+    output = args.output or (args.output_root or ROOT / "models") / name
     if output.exists():
         raise FileExistsError("Training requires a NEW output directory")
     output.mkdir(parents=True)
+    start_run_log(output, args=args, cfg=cfg, model=model, architecture=ARCHITECTURE, root=ROOT)
     deadline = time.monotonic() + cfg["runtime"]["wall_time_hours"]*3600
     reserve = cfg["runtime"]["finalization_reserve_s"]
     fixtures, baselines = build_guard(model.registry, model, cfg)
-    fresh = payload["guard_parent"] is None
-    # A fresh controller is only held to the primary baseline, not to its random initialization.
-    initial = guard(fixtures, baselines, model, cfg, {"rows": baselines} if fresh else payload["guard_parent"])
+    new = payload["guard_parent"] is None
+    # A fresh lineage keeps the primary baseline (no score) as parent; its runs may start infeasible.
+    fresh = new or "score" not in payload["guard_parent"]
+    initial = guard(fixtures, baselines, model, cfg, {"rows": baselines} if new else payload["guard_parent"])
     if not initial["gate"]["passed"] and not fresh:
         raise RuntimeError("The initial checkpoint is infeasible on the physical guard")
-    parent = payload["guard_parent"] if args.resume else {"rows": baselines} if fresh else initial
+    parent = payload["guard_parent"] if args.resume else {"rows": baselines} if new else initial
     if args.resume:
         best_guard = deepcopy(payload["best_guard"])
         best_model = deepcopy(payload["best_model_state_dict"])
         best_epoch = payload["best_epoch"]
-        best_controller = _selected_model(model, best_model, cfg)
-        replay_best = guard(fixtures, baselines, best_controller, cfg, parent)
-        if not replay_best["gate"]["passed"] or abs(replay_best["score"]-best_guard["score"]) > 1e-10:
-            raise RuntimeError("Saved best guard cannot be reproduced on the resume fixture")
+        if best_guard["gate"]["passed"]:
+            best_controller = _selected_model(model, best_model, cfg)
+            replay_best = guard(fixtures, baselines, best_controller, cfg, parent)
+            if not replay_best["gate"]["passed"] or abs(replay_best["score"]-best_guard["score"]) > 1e-10:
+                raise RuntimeError("Saved best guard cannot be reproduced on the resume fixture")
     else:
         best_guard = initial if initial["gate"]["passed"] else {"score": math.inf, "gate": {"passed": False}}
         best_model, best_epoch = deepcopy(model.state_dict()), 0
@@ -697,7 +717,8 @@ def train(args):
     recent, completed, attempted_updates, rejected = [], 0, 0, 0
     last_checked = initial
     interruption = False
-    for epoch in range(start_epoch+1, cfg["training"]["epochs"]+1):
+    # The cosine schedule follows --epochs; --stop-epoch only ends this run early.
+    for epoch in range(start_epoch+1, stop_epoch+1):
         forecast = max(cfg["runtime"]["minimum_epoch_forecast_s"],
                        max(recent[-4:], default=240)*cfg["runtime"]["epoch_time_safety_factor"])
         if deadline-time.monotonic() < reserve+forecast:
@@ -755,9 +776,11 @@ def train(args):
         history.append({"attempted_epoch": epoch, "complete_epoch_index": len(history)+1,
             "updates": (len(history)+1)*4, "differentiable_rollouts": (len(history)+1)*6,
             "guard_score": last_checked["score"] if last_checked else None,
+            "mean_loss": sum(r["loss"] for r in rows)/len(rows),
             "learning_rates": rates, "elapsed_seconds": seconds})
         save_checkpoint(output / "last.pt", model, payload, config=cfg, epoch=epoch, optimizer=optimizer,
                         history=history, best_guard=best_guard, best_model=best_model, best_epoch=best_epoch)
+        write_json(output / "history.json", history)
     # Always check the last COMPLETE epoch before returning; no final-suite selection.
     if completed and last_checked is None:
         last_checked = guard(fixtures, baselines, model, cfg, parent)
@@ -773,6 +796,8 @@ def train(args):
         "completed_new_differentiable_rollouts": completed*6, "executed_updates_including_rollbacks": attempted_updates,
         "rejected_epochs": rejected, "interrupted": interruption, "best_epoch": best_epoch,
         "initial_guard": initial, "best_guard": best_guard, "last_complete_guard": last_checked,
+        "wall_seconds": time.monotonic()-started,
+        "epoch_seconds": [row["elapsed_seconds"] for row in history[len(history)-completed:]],
         "final_suite_used_for_selection": False, "full_BPTT": True,
         "output": str(output.resolve())}
     print(f"Completed {completed} new epochs; selected epoch {best_epoch}. Checkpoints: {output.resolve()}", flush=True)
@@ -785,6 +810,8 @@ def train(args):
     save_checkpoint(output / "selected_controller.pt", _selected_model(model, best_model, cfg),
                     payload, config=cfg, epoch=best_epoch, history=history,
                     best_guard=best_guard, best_model=best_model, best_epoch=best_epoch)
+    write_json(output / "history.json", history)
+    write_json(output / "summary.json", result)
     return result
 
 
@@ -803,5 +830,11 @@ def main(argv=None):
     parser.add_argument("--resume", type=Path, help="Continue an exact complete-epoch Adam/RNG state")
     parser.add_argument("--epochs", type=int, help="Total target epoch count (resume begins after its saved epoch)")
     parser.add_argument("--budget-hours", type=float, help="Cooperative total budget, stopping between complete epochs")
+    parser.add_argument("--fresh", action="store_true", help="Start from a new seeded controller (the default without --model/--resume)")
+    parser.add_argument("--stop-epoch", type=int, help="Stop after this epoch while keeping the --epochs schedule")
+    parser.add_argument("--init-seed", type=int, help="Seed of the fresh controller initialization only "
+                        "(training scenarios keep the settings seed; default: the settings seed)")
     parser.add_argument("--output", type=Path, help="New output directory")
+    parser.add_argument("--output-root", type=Path, help="Parent of an automatically named new output directory "
+                        "(default: models/)")
     return train(parser.parse_args(argv))

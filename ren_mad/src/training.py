@@ -7,6 +7,7 @@ import json
 import math
 import numpy as np
 import random
+import signal
 import time
 import torch
 from collections import defaultdict
@@ -19,6 +20,7 @@ from pathlib import Path
 from .controller import checked_certificate, CurrentAwareController
 from .model_io import ROOT, DEFAULT_MODEL, load_model, save_checkpoint
 from .plant import build_registry, Plant, topology_library, VoltageDomainError
+from .run_log import start_run_log, write_json
 from .settings import default_parameters
 from .simulation import trajectory_metrics, run_scenario, Scenario, experiment_loads, fixed_scenario
 
@@ -631,6 +633,9 @@ def make_optimizer(model, settings, learn_edges=False):
     return torch.optim.Adam(groups)
 
 
+ARCHITECTURE = "ren"
+
+
 # Training entry point
 
 
@@ -651,8 +656,8 @@ def validate_config(cfg):
 
 
 def fresh_model(cfg):
-    """New controller initialized from the settings seed, with a portable checkpoint template."""
-    torch.manual_seed(cfg["seed"])
+    """New controller initialized from the init seed, with a portable checkpoint template."""
+    torch.manual_seed(cfg["init_seed"])
     model = CurrentAwareController(build_registry(), **cfg["controller"])
     descriptor = {"class": "CurrentAwareController", **cfg["controller"],
         "permanent_edge_order": [list(e) for e in model.registry.edges],
@@ -663,10 +668,18 @@ def fresh_model(cfg):
 
 def train(args):
     torch.set_num_threads(1)
+    # Batch schedulers stop jobs with SIGTERM; treat it like Ctrl-C (roll back the partial epoch).
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    started = time.monotonic()
     if args.fresh and args.resume:
         raise ValueError("Use either --resume or --fresh")
+    if args.init_seed is not None and (args.resume or args.model != DEFAULT_MODEL):
+        raise ValueError("--init-seed only applies to a fresh controller")
+    # A seed sweep must never silently continue the released controller.
+    args.fresh = args.fresh or args.init_seed is not None
     if args.fresh:
         cfg = default_parameters()
+        cfg["init_seed"] = cfg["seed"] if args.init_seed is None else args.init_seed
         model, payload = fresh_model(cfg)
     else:
         model, payload = load_model(args.resume or args.model)
@@ -703,10 +716,14 @@ def train(args):
         torch.manual_seed(cfg["seed"])
         random.seed(cfg["seed"])
     checked_certificate(model)
-    output = args.output or ROOT / "models" / ("training_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ"))
+    # Unique per run (method, init seed, UTC time); an existing directory is never reused.
+    name = "_".join([ARCHITECTURE, *([f"init{cfg['init_seed']}"] if "init_seed" in cfg else []),
+                     datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")])
+    output = args.output or (args.output_root or ROOT / "models") / name
     if output.exists():
         raise FileExistsError("Training requires a NEW output directory")
     output.mkdir(parents=True)
+    start_run_log(output, args=args, cfg=cfg, model=model, architecture=ARCHITECTURE, root=ROOT)
     deadline = time.monotonic() + cfg["runtime"]["wall_time_hours"]*3600
     reserve = cfg["runtime"]["finalization_reserve_s"]
     fixtures, baselines = build_guard(model.registry, model, cfg)
@@ -801,9 +818,11 @@ def train(args):
         history.append({"attempted_epoch": epoch, "complete_epoch_index": len(history)+1,
             "updates": (len(history)+1)*4, "differentiable_rollouts": (len(history)+1)*6,
             "guard_score": last_checked["score"] if last_checked else None,
+            "mean_loss": sum(r["loss"] for r in rows)/len(rows),
             "learning_rates": rates, "elapsed_seconds": seconds})
         save_checkpoint(output / "last.pt", model, payload, config=cfg, epoch=epoch, optimizer=optimizer,
                         history=history, best_guard=best_guard, best_model=best_model, best_epoch=best_epoch)
+        write_json(output / "history.json", history)
     # Always check the last COMPLETE epoch before returning; no final-suite selection.
     if completed and last_checked is None:
         last_checked = guard(fixtures, baselines, model, cfg, parent)
@@ -819,6 +838,8 @@ def train(args):
         "completed_new_differentiable_rollouts": completed*6, "executed_updates_including_rollbacks": attempted_updates,
         "rejected_epochs": rejected, "interrupted": interruption, "best_epoch": best_epoch,
         "initial_guard": initial, "best_guard": best_guard, "last_complete_guard": last_checked,
+        "wall_seconds": time.monotonic()-started,
+        "epoch_seconds": [row["elapsed_seconds"] for row in history[len(history)-completed:]],
         "final_suite_used_for_selection": False, "full_BPTT": True,
         "certificate_selected": checked_certificate(_selected_model(model, best_model, cfg)),
         "output": str(output.resolve())}
@@ -832,6 +853,8 @@ def train(args):
     save_checkpoint(output / "selected_controller.pt", _selected_model(model, best_model, cfg),
                     payload, config=cfg, epoch=best_epoch, history=history,
                     best_guard=best_guard, best_model=best_model, best_epoch=best_epoch)
+    write_json(output / "history.json", history)
+    write_json(output / "summary.json", result)
     return result
 
 
@@ -853,5 +876,9 @@ def main(argv=None):
     parser.add_argument("--fresh", action="store_true", help="Start from a new seeded controller instead of --model")
     parser.add_argument("--stop-epoch", type=int, help="Stop after this epoch while keeping the --epochs schedule")
     parser.add_argument("--learn-edges", action="store_true", help="Offline optimization of ten bounded independent weights")
+    parser.add_argument("--init-seed", type=int, help="Seed of the fresh controller initialization only, implies --fresh "
+                        "(training scenarios keep the settings seed; default: the settings seed)")
     parser.add_argument("--output", type=Path, help="New output directory")
+    parser.add_argument("--output-root", type=Path, help="Parent of an automatically named new output directory "
+                        "(default: models/)")
     return train(parser.parse_args(argv))

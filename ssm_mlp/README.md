@@ -39,14 +39,21 @@ python main_PnP_training.py --epochs 150 --budget-hours 2.5
 Resume a run, or start a new optimizer from a checkpoint:
 
 ```bash
-python main_PnP_training.py --resume models/training_<UTC>/last.pt --epochs 200
-python main_PnP_training.py --model models/training_<UTC>/selected_controller.pt --epochs 50
+python main_PnP_training.py --resume models/<run>/last.pt --epochs 200
+python main_PnP_training.py --model models/<run>/selected_controller.pt --epochs 50
 ```
 
 Generate the figures from a trained controller:
 
 ```bash
-python main_PnP_validation.py --model models/training_<UTC>/selected_controller.pt --controls
+python main_PnP_validation.py --model models/<run>/selected_controller.pt --controls
 ```
 
 A fresh run is gated against the primary-controller baseline. Its random initialization is never used as the parent.
+
+The command line matches `../ren_mad`: `--fresh` (the default here) starts from the settings seed, and `--stop-epoch` ends a run early while keeping the cosine schedule of `--epochs`. The REN/MAD protocol is therefore reproduced with:
+
+```bash
+python main_PnP_training.py --fresh --epochs 152 --budget-hours 100
+python main_PnP_training.py --resume models/<run>/last.pt --epochs 250 --stop-epoch 212 --budget-hours 100
+```
