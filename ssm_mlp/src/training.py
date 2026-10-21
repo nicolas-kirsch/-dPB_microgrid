@@ -16,8 +16,7 @@ from datetime import datetime, timezone
 from math import isfinite, cos, pi
 from numbers import Integral
 from pathlib import Path
-from .controller import checked_certificate, CurrentAwareController
-from .model_io import ROOT, DEFAULT_MODEL, load_model, save_checkpoint
+from .model_io import ROOT, build_model, load_model, save_checkpoint
 from .plant import Plant, topology_library, VoltageDomainError
 from .settings import default_parameters
 from .simulation import trajectory_metrics, run_scenario, Scenario, experiment_loads, fixed_scenario
@@ -57,7 +56,7 @@ def rich_loss(trace, event_samples=(0,), config=None):
     """Return (weighted scalar, raw component dictionary).
 
     Observation k and the control applied at k are aligned. Terminal observation
-    contributes separately; effort never penalizes un-applied pre-MAD z. First
+    contributes separately; effort only penalizes the applied input u. First
     and second differences are converted to their old .5ms interval equivalents.
     """
     cfg = LossConfig() if config is None else config
@@ -158,8 +157,8 @@ def calibrated_loss_config(trace, event_samples, base_config, priorities=None,
     reference-step second difference uses (1 mV)^2, and occupancy uses .05.
     Effort cannot be divided by baseline effort, since applied baseline delta_u
     is zero: its fixed scales are declared in volts.  The separate 10 V excess
-    penalties remain 200/500.  Physical trajectories, residuals, certificate
-    norms, objective components and window definitions are never rescaled.
+    penalties remain 200/500.  Physical trajectories, residuals, objective
+    components and window definitions are never rescaled.
     """
     if not isinstance(base_config, LossConfig):
         raise TypeError("The baseline objective must use LossConfig")
@@ -207,7 +206,7 @@ def calibrated_loss_config(trace, event_samples, base_config, priorities=None,
     active = trace["active"][:-1].bool()
     record = {
         "method": "loss_weight=priority/max(detached_baseline_component,physical_floor)",
-        "scope": "LOSS WEIGHTS ONLY; no state, residual, feature or certificate normalization",
+        "scope": "LOSS WEIGHTS ONLY; no state, residual or feature normalization",
         "event_samples": [int(k) for k in event_samples],
         "baseline_raw_components": raw, "priorities": dict(selected),
         "physical_floors": floors, "denominators": denominators,
@@ -325,7 +324,7 @@ def transient_components(trace, event_samples, window_s):
     """All observed states, including the terminal sample if it is in-window.
 
     Equilibrium-subtracted current belongs ONLY to this model-aware LOSS.
-    The runtime MAD current feature is raw measured It, never this deviation.
+    The controller context uses the raw measured It, never this deviation.
     """
     if not isfinite(window_s) or window_s <= 0:
         raise ValueError("The early-state window must be finite and positive")
@@ -459,27 +458,6 @@ def group_score(case_losses):
     return {"score": sum(means.values())/4, "group_means": means}
 
 
-def freeze_edges(controller):
-    snapshot = {}
-    for name in ("edge_logits", "log_edge_weights"):
-        if hasattr(controller, name):
-            parameter = getattr(controller, name)
-            snapshot[name] = parameter.detach().clone()
-            parameter.requires_grad_(False)
-            parameter.grad = None
-    snapshot["effective_edge_weights"] = controller.effective_edge_weights().detach().clone()
-    return snapshot
-
-
-def assert_edges_frozen(controller, snapshot):
-    for name, expected in snapshot.items():
-        actual = (controller.effective_edge_weights() if name == "effective_edge_weights"
-                  else getattr(controller, name))
-        if not torch.equal(actual.detach(), expected):
-            raise RuntimeError("Frozen learned edge weights changed")
-        if name != "effective_edge_weights" and actual.requires_grad:
-            raise RuntimeError("Frozen edge parameter unexpectedly requires gradients")
-
 def epoch_scenarios(registry, cfg, epoch):
     cases = {}
     for j, case in enumerate(focused_cases()):
@@ -551,7 +529,7 @@ def evaluate_guard(fixtures, baseline_rows, controller, cfg):
     losses, rows, component_rows = {}, {}, {}
     with torch.no_grad():
         for case, (scenario, loss_cfg) in fixtures.items():
-            trace = run_scenario(scenario, controller, "mad")
+            trace = run_scenario(scenario, controller, "pb")
             loss, components = transient_loss(trace, tuple(scenario.events) or (0,), loss_cfg)
             losses[case] = float(loss)
             rows[case] = trajectory_metrics(trace)
@@ -574,7 +552,7 @@ def backward_group(controller, scenarios, cfg):
     for case, scenario in scenarios:
         start = time.monotonic()
         loss_cfg, calibration = calibrate_transient_scenario(scenario, controller, cfg)
-        trace = run_scenario(scenario, controller, "mad")
+        trace = run_scenario(scenario, controller, "pb")
         loss, components = transient_loss(trace, tuple(scenario.events) or (0,), loss_cfg)
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError("Nonfinite physical loss; no group update made")
@@ -613,19 +591,17 @@ def guard(fixtures, baselines, controller, cfg, parent):
                 "score":None,"rows":{},"selection_data":"infeasible training guard; no fabricated metrics"}
 
 
-def make_optimizer(model, settings, learn_edges=False):
-    rates = {"ren": settings["ren_learning_rate"], "eta": settings["eta_learning_rate"],
-        "mad_first": settings["mad_first_learning_rate"], "mad_final": settings["mad_final_learning_rate"],
-        "edge": settings.get("edge_learning_rate", .03)}
+def make_optimizer(model, settings):
+    """Full rate on every M_p recurrent core; reduced rate on mixer/gate heads and M_b."""
+    rates = {"core": settings["core_learning_rate"], "head": settings["head_learning_rate"]}
+    if not all(math.isfinite(rate) and rate > 0 for rate in rates.values()):
+        raise ValueError("Finite positive learning rates required")
+    core = {id(p) for p in model.core_parameters()}
     groups = []
     for name, parameter in model.named_parameters():
-        edge = name in ("edge_logits", "log_edge_weights")
-        if edge: parameter.requires_grad_(learn_edges)
-        if not parameter.requires_grad: continue
-        kind = ("edge" if edge else "ren" if name.startswith("rens.")
-            else "eta" if name.startswith("eta_") else "mad_first" if ".mlp.0." in name else "mad_final")
-        if not math.isfinite(rates[kind]) or rates[kind] <= 0:
-            raise ValueError("Finite positive learning rate required")
+        if not parameter.requires_grad:
+            continue
+        kind = "core" if id(parameter) in core else "head"
         groups.append({"params": [parameter], "lr": rates[kind], "initial_lr": rates[kind],
                        "kind": kind, "name": name})
     return torch.optim.Adam(groups)
@@ -638,8 +614,8 @@ def make_optimizer(model, settings, learn_edges=False):
 
 
 def validate_config(cfg):
-    if cfg["h_s"] != 5e-5 or cfg["controller"]["gamma_R"] != 25:
-        raise ValueError("The released physical configuration uses h=50 us and gamma_R=25")
+    if cfg["h_s"] != 5e-5:
+        raise ValueError("The physical configuration uses h=50 us")
     if cfg["training"]["duration_s"] != .15:
         raise ValueError("Full 150 ms BPTT is required by this training recipe")
     if cfg["training"]["epochs"] < 1:
@@ -652,23 +628,28 @@ def validate_config(cfg):
 
 def train(args):
     torch.set_num_threads(1)
-    model, payload = load_model(args.resume or args.model)
-    cfg = deepcopy(payload["config"]) if args.resume else default_parameters()
-    if cfg["controller"] != payload["config"]["controller"] or cfg["primary"] != payload["config"]["primary"]:
-        raise ValueError("Checkpoint architecture and primary must match the configuration")
+    if args.resume and args.model:
+        raise ValueError("Use either --resume or --model")
+    if args.resume or args.model:
+        model, payload = load_model(args.resume or args.model)
+        cfg = deepcopy(payload["config"]) if args.resume else default_parameters()
+        if cfg["controller"] != payload["config"]["controller"] or cfg["primary"] != payload["config"]["primary"]:
+            raise ValueError("Checkpoint architecture and primary must match the configuration")
+    else:
+        # Fresh start: a new controller initialized from the settings seed.
+        cfg = default_parameters()
+        torch.manual_seed(cfg["seed"])
+        model, payload = build_model(cfg), {"guard_parent": None}
     if args.epochs is not None:
         cfg["training"]["epochs"] = args.epochs
     if args.budget_hours is not None:
         cfg["runtime"]["wall_time_hours"] = args.budget_hours
-    cfg["training"]["freeze_edge_weights"] = not args.learn_edges
     validate_config(cfg)
     start_epoch = payload["epoch"] if args.resume else 0
     if cfg["training"]["epochs"] <= start_epoch:
         raise ValueError("For resume, --epochs is the TOTAL target, greater than the saved epoch")
-    if args.resume and args.learn_edges:
-        raise ValueError("Use a fresh optimizer (--model) when reopening edge optimization")
-    optimizer = make_optimizer(model, cfg["training"], args.learn_edges)
-    edges = None if args.learn_edges else freeze_edges(model)
+    model.train()
+    optimizer = make_optimizer(model, cfg["training"])
     if args.resume:
         if payload["optimizer_state_dict"] is None:
             raise ValueError("Resume needs a training-state checkpoint with Adam state")
@@ -682,7 +663,6 @@ def train(args):
     else:
         torch.manual_seed(cfg["seed"])
         random.seed(cfg["seed"])
-    checked_certificate(model)
     output = args.output or ROOT / "models" / ("training_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ"))
     if output.exists():
         raise FileExistsError("Training requires a NEW output directory")
@@ -690,10 +670,12 @@ def train(args):
     deadline = time.monotonic() + cfg["runtime"]["wall_time_hours"]*3600
     reserve = cfg["runtime"]["finalization_reserve_s"]
     fixtures, baselines = build_guard(model.registry, model, cfg)
-    initial = guard(fixtures, baselines, model, cfg, payload["guard_parent"])
-    if not initial["gate"]["passed"]:
+    fresh = payload["guard_parent"] is None
+    # A fresh controller is only held to the primary baseline, not to its random initialization.
+    initial = guard(fixtures, baselines, model, cfg, {"rows": baselines} if fresh else payload["guard_parent"])
+    if not initial["gate"]["passed"] and not fresh:
         raise RuntimeError("The initial checkpoint is infeasible on the physical guard")
-    parent = payload["guard_parent"] if args.resume else initial
+    parent = payload["guard_parent"] if args.resume else {"rows": baselines} if fresh else initial
     if args.resume:
         best_guard = deepcopy(payload["best_guard"])
         best_model = deepcopy(payload["best_model_state_dict"])
@@ -703,7 +685,8 @@ def train(args):
         if not replay_best["gate"]["passed"] or abs(replay_best["score"]-best_guard["score"]) > 1e-10:
             raise RuntimeError("Saved best guard cannot be reproduced on the resume fixture")
     else:
-        best_guard, best_model, best_epoch = initial, deepcopy(model.state_dict()), 0
+        best_guard = initial if initial["gate"]["passed"] else {"score": math.inf, "gate": {"passed": False}}
+        best_model, best_epoch = deepcopy(model.state_dict()), 0
     payload["guard_parent"] = deepcopy(parent)
     history = deepcopy(payload.get("history", [])) if args.resume else []
     checkpoint_args = dict(config=cfg, history=history, best_guard=best_guard,
@@ -734,12 +717,9 @@ def train(args):
                 gradients = [p.grad for p in model.parameters() if p.grad is not None]
                 if not gradients or not all(bool(torch.isfinite(g).all()) for g in gradients):
                     raise FloatingPointError("Missing or nonfinite gradients")
-                norm = float(torch.stack([g.detach().square().sum() for g in gradients]).sum().sqrt())
+                norm = float(torch.stack([g.detach().abs().square().sum() for g in gradients]).sum().sqrt())
                 optimizer.step()
                 attempted_updates += 1
-                if edges is not None:
-                    assert_edges_frozen(model, edges)
-                checked_certificate(model)
                 for row in group_rows:
                     row.update(attempted_epoch=epoch, gradient_norm=norm, learning_rates=rates)
                 rows.extend(group_rows)
@@ -794,7 +774,6 @@ def train(args):
         "rejected_epochs": rejected, "interrupted": interruption, "best_epoch": best_epoch,
         "initial_guard": initial, "best_guard": best_guard, "last_complete_guard": last_checked,
         "final_suite_used_for_selection": False, "full_BPTT": True,
-        "certificate_selected": checked_certificate(_selected_model(model, best_model, cfg)),
         "output": str(output.resolve())}
     print(f"Completed {completed} new epochs; selected epoch {best_epoch}. Checkpoints: {output.resolve()}", flush=True)
     # Store the final report inside the two checkpoints, with no sidecar files.
@@ -813,17 +792,16 @@ def _selected_model(model, state, cfg):
     # The registry contains immutable mapping proxies, so reconstruct the module.
     # This copy must not consume the RNG state used for exact continuation.
     with torch.random.fork_rng(devices=[]):
-        selected = CurrentAwareController(model.registry, **cfg["controller"])
+        selected = build_model(cfg)
         selected.load_state_dict(state, strict=True)
     return selected
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="Start a new optimizer from these weights")
+    parser.add_argument("--model", type=Path, help="Start a new optimizer from these weights (default: fresh controller)")
     parser.add_argument("--resume", type=Path, help="Continue an exact complete-epoch Adam/RNG state")
     parser.add_argument("--epochs", type=int, help="Total target epoch count (resume begins after its saved epoch)")
     parser.add_argument("--budget-hours", type=float, help="Cooperative total budget, stopping between complete epochs")
-    parser.add_argument("--learn-edges", action="store_true", help="Offline optimization of ten bounded independent weights")
     parser.add_argument("--output", type=Path, help="New output directory")
     return train(parser.parse_args(argv))
